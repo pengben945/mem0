@@ -733,24 +733,27 @@ class Memory(MemoryBase):
         Adds new memories scoped to a single session id (e.g. `user_id`, `agent_id`, or `run_id`). One of those ids is required.
 
         Args:
-            messages (str or List[Dict[str, str]]): The message content or list of messages
-                (e.g., `[{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi"}]`)
-                to be processed and stored.
-            user_id (str, optional): ID of the user creating the memory. Defaults to None.
-            agent_id (str, optional): ID of the agent creating the memory. Defaults to None.
-            run_id (str, optional): ID of the run creating the memory. Defaults to None.
-            metadata (dict, optional): Metadata to store with the memory. Defaults to None.
-            timestamp (Any, optional): Platform-only temporal parameter. Not supported in OSS.
-            expiration_date (Any, optional): Date in YYYY-MM-DD format. Expired memories are hidden
-                from search and get_all unless show_expired is True.
-            infer (bool, optional): If True (default), an LLM is used to extract key facts from
-                'messages' and decide whether to add, update, or delete related memories.
-                If False, 'messages' are added as raw memories directly.
-            memory_type (str, optional): Specifies the type of memory. Currently, only
-                `MemoryType.PROCEDURAL.value` ("procedural_memory") is explicitly handled for
-                creating procedural memories (typically requires 'agent_id'). Otherwise, memories
-                are treated as general conversational/factual memories.
-            prompt (str, optional): Prompt to use for the memory creation. Defaults to None.
+            messages (str | list[dict]): 要写入记忆的原始消息。
+                既可以传一段字符串，也可以传单条消息 dict，或者传消息列表。
+                最终会统一整理成消息序列，再进入抽取/写库流程。
+            user_id (str, optional): 记忆所属用户的作用域 ID。
+                这是最常见的隔离维度，写入和搜索时都会用它来限定范围。
+            agent_id (str, optional): 记忆所属 agent 的作用域 ID。
+                当你想按 agent 维度存储或检索记忆时使用。
+            run_id (str, optional): 记忆所属一次运行/会话的作用域 ID。
+                适合把某次执行过程中的记忆单独隔离出来。
+            metadata (dict, optional): 附加元数据。
+                会被一起写入存储层，常用于记录来源、标签、模型上下文等业务信息。
+            timestamp (Any, optional): 平台侧的时间控制参数。
+                OSS 版本不支持；如果传入会直接报错，避免误以为生效。
+            expiration_date (Any, optional): 过期日期，格式通常是 `YYYY-MM-DD`。
+                设置后，过期记忆默认不会在 search/get_all 中返回，除非显式开启 show_expired。
+            infer (bool, optional): 是否让 LLM 先“理解再写入”。
+                True 时会抽取关键事实并判断新增/更新/删除；False 时直接把原消息当作记忆写入。
+            memory_type (str, optional): 记忆类型。
+                目前只显式支持 `procedural_memory`，表示程序性/操作性记忆；其它值会被拒绝。
+            prompt (str, optional): 自定义抽取提示词。
+                用来覆盖默认提示词，影响 LLM 看到的上下文和抽取策略。
 
 
         Returns:
@@ -768,8 +771,10 @@ class Memory(MemoryBase):
         if timestamp is not None:
             raise ValueError(get_temporal_feature_error_message("sync", "add", "timestamp"))
 
+        # 1) 先把时间/过期时间等平台能力做拦截与归一化，OSS 只保留支持的那部分。
         normalized_expiration_date = _normalize_expiration_date(expiration_date)
         temporal_usage_notice = detect_temporal_usage_from_metadata(metadata)
+        # 2) 统一构造元数据和作用域过滤条件：user_id / agent_id / run_id 会被折叠进同一套过滤器里。
         processed_metadata, effective_filters = _build_filters_and_metadata(
             user_id=user_id,
             agent_id=agent_id,
@@ -779,6 +784,7 @@ class Memory(MemoryBase):
         if normalized_expiration_date is not None:
             processed_metadata["expiration_date"] = normalized_expiration_date
 
+        # 3) memory_type 目前只显式支持 procedural_memory，其它值直接拒绝，避免静默走错分支。
         if memory_type is not None and memory_type != MemoryType.PROCEDURAL.value:
             raise Mem0ValidationError(
                 message=f"Invalid 'memory_type'. Please pass {MemoryType.PROCEDURAL.value} to create procedural memories.",
@@ -787,6 +793,7 @@ class Memory(MemoryBase):
                 suggestion=f"Use '{MemoryType.PROCEDURAL.value}' to create procedural memories."
             )
 
+        # 4) 入参兼容三种形态：字符串、单条 dict、list[dict]；统一转成消息列表方便后续处理。
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
 
@@ -801,6 +808,7 @@ class Memory(MemoryBase):
                 suggestion="Convert your input to a string, dictionary, or list of dictionaries."
             )
 
+        # 5) agent + procedural_memory 走专用路径：直接生成程序性记忆，不进入通用的向量抽取流水线。
         if agent_id is not None and memory_type == MemoryType.PROCEDURAL.value:
             results = self._create_procedural_memory(messages, metadata=processed_metadata, prompt=prompt)
             scale_threshold_notice = detect_scale_threshold_from_add_result(self, results)
@@ -812,11 +820,13 @@ class Memory(MemoryBase):
                 display_first_run_notice(self, "sync", "add")
             return results
 
+        # 6) 如果开启视觉能力，先把图片/多模态消息转成模型可消费的结构；否则只做普通消息规范化。
         if self.config.llm.config.get("enable_vision"):
             messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
         else:
             messages = parse_vision_messages(messages)
 
+        # 7) 通用记忆写入：先让 LLM 抽取增量事实，再写入向量库和历史记录。
         vector_store_result = self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, prompt=prompt)
         scale_threshold_notice = detect_scale_threshold_from_add_result(self, vector_store_result)
         if temporal_usage_notice:
@@ -829,6 +839,7 @@ class Memory(MemoryBase):
 
     def _add_to_vector_store(self, messages, metadata, filters, infer, prompt=None):
         if not infer:
+            # 非推理模式：把每条用户消息直接当成一条记忆写入，不做 LLM 抽取。
             returned_memories = []
             for message_dict in messages:
                 if (
@@ -866,12 +877,14 @@ class Memory(MemoryBase):
 
         # === V3 PHASED BATCH PIPELINE ===
 
-        # Phase 0: Context gathering
+        # Phase 0: 上下文采集
+        # 先取最近对话历史，再让 LLM 在“当前输入 + 历史上下文”里判断该新增/更新/删除什么。
         session_scope = _build_session_scope(filters)
         last_messages = self.db.get_last_messages(session_scope, limit=10)
         parsed_messages = parse_messages(messages)
 
-        # Phase 1: Existing memory retrieval
+        # Phase 1: 召回已有记忆
+        # 先查一次向量库，拿到当前范围内的已有记忆，作为 LLM 去重和增量判断的参照。
         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         query_embedding = self.embedding_model.embed(parsed_messages, "search")
         existing_results = self.vector_store.search(
@@ -881,19 +894,21 @@ class Memory(MemoryBase):
             filters=search_filters,
         )
 
-        # Map UUIDs to integers (anti-hallucination)
+        # 为了降低 LLM 幻觉，把真实 UUID 映射成短整数 ID 再交给模型描述。
         existing_memories = []
         uuid_mapping = {}
         for idx, mem in enumerate(existing_results):
             uuid_mapping[str(idx)] = mem.id
             existing_memories.append({"id": str(idx), "text": mem.payload.get("data", "")})
 
-        # Phase 2: LLM extraction (single call)
+        # Phase 2: LLM 抽取（单次调用）
+        # 根据当前作用域决定提示词：agent 作用域会额外注入 agent 语境。
         is_agent_scoped = bool(filters.get("agent_id")) and not filters.get("user_id")
         system_prompt = ADDITIVE_EXTRACTION_PROMPT
         if is_agent_scoped:
             system_prompt += AGENT_CONTEXT_SUFFIX
 
+        # 用户可自定义提示词；没有就用实例级 custom_instructions。
         custom_instr = prompt or self.custom_instructions
 
         user_prompt = generate_additive_extraction_prompt(
@@ -915,7 +930,7 @@ class Memory(MemoryBase):
             logger.error(f"LLM extraction failed: {e}")
             return []
 
-        # Parse response
+        # 解析 LLM 返回：先去代码块，再按 JSON 解析，解析失败就尝试从文本中再提取 JSON。
         try:
             response = remove_code_blocks(response)
             if not response or not response.strip():
@@ -931,17 +946,18 @@ class Memory(MemoryBase):
             extracted_memories = []
 
         if not extracted_memories:
-            # Save messages even if nothing extracted
+            # 即使没有抽出任何记忆，也要保存原始消息历史，方便下次 add/search 复用上下文。
             self.db.save_messages(messages, session_scope)
             return []
 
-        # Phase 3: Batch embed all extracted memory texts
+        # Phase 3: 批量向量化
+        # 把抽出的记忆文本尽量批量 embedding，失败再降级为逐条 embedding。
         mem_texts = [m.get("text", "") for m in extracted_memories if m.get("text")]
         try:
             mem_embeddings_list = self.embedding_model.embed_batch(mem_texts, "add")
             embed_map = dict(zip(mem_texts, mem_embeddings_list))
         except Exception:
-            # Fallback: embed individually
+            # 批量 embedding 不可用时，逐条补救，保证可用性优先。
             embed_map = {}
             for text in mem_texts:
                 try:
@@ -949,8 +965,8 @@ class Memory(MemoryBase):
                 except Exception as e:
                     logger.warning(f"Failed to embed memory text: {e}")
 
-        # Phase 4: Per-memory CPU processing + Phase 5: Hash dedup
-        # Build set of existing hashes for dedup
+        # Phase 4/5: 逐条处理 + 哈希去重
+        # 先收集已有哈希，再过滤当前批次重复文本，避免重复写入向量库。
         existing_hashes = set()
         for mem in existing_results:
             h = mem.payload.get("hash") if hasattr(mem, "payload") and mem.payload else None
@@ -964,12 +980,14 @@ class Memory(MemoryBase):
             if not text or text not in embed_map:
                 continue
 
+            # 同一条文本在“已存在结果”和“本批次内部”都要去重。
             mem_hash = hashlib.md5(text.encode()).hexdigest()
             if mem_hash in existing_hashes or mem_hash in seen_hashes:
                 logger.debug(f"Skipping duplicate memory (hash match): {text[:50]}")
                 continue
             seen_hashes.add(mem_hash)
 
+            # 组织最终落库 payload：保留原文、词形归一结果、hash、时间戳等。
             text_lemmatized = lemmatize_for_bm25(text)
 
             memory_id = str(uuid.uuid4())
@@ -1340,11 +1358,13 @@ class Memory(MemoryBase):
         Searches for memories based on a query.
 
         Args:
-            query (str): Query to search for.
-            top_k (int, optional): Maximum number of results to return. Defaults to 20.
-            filters (dict): Filter dict containing entity IDs and optional metadata filters.
-                Must contain at least one of: user_id, agent_id, run_id.
-                Example: filters={"user_id": "u1", "agent_id": "a1"}
+            query (str): 要搜索的自然语言问题或关键词。
+                它会同时用于语义向量检索和关键词检索，所以越像真实查询越好。
+            top_k (int, optional): 最多返回多少条结果。
+                既控制最终返回数量，也会影响内部召回池大小和性能提示判断。
+            filters (dict): 过滤条件字典。
+                至少要包含 `user_id` / `agent_id` / `run_id` 之一，用来限定搜索作用域。
+                也可以附带额外的元数据过滤条件，例如 `{"user_id": "u1", "tag": "work"}`。
 
                 Enhanced metadata filtering with operators:
                 - {"key": "value"} - exact match
@@ -1362,32 +1382,36 @@ class Memory(MemoryBase):
                 - {"AND": [filter1, filter2]} - logical AND
                 - {"OR": [filter1, filter2]} - logical OR
                 - {"NOT": [filter1]} - logical NOT
-            threshold (float, optional): Minimum score for a memory to be included. Defaults to 0.1.
-            rerank (bool, optional): Whether to rerank results. Defaults to False.
-            explain (bool, optional): Whether to include score_details for each result. Defaults to False.
-            reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
-            show_expired (bool, optional): Include expired memories. Defaults to False.
+            threshold (float, optional): 最低得分阈值。
+                低于这个分数的记忆会被过滤掉，默认 0.1。
+            rerank (bool, optional): 是否启用二次排序。
+                开启后会把初步召回结果再交给 reranker 精排一次。
+            explain (bool, optional): 是否返回每条结果的打分细节。
+                适合调试为什么某条记忆被召回。
+            reference_date (Any, optional): 平台侧时间参考参数。
+                OSS 版本不支持；如果传入会直接报错。
+            show_expired (bool, optional): 是否把已过期记忆也返回。
+                默认 False，开发调试时如果想看历史数据可以打开。
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}`
 
         Raises:
-            ValueError: If filters doesn't contain at least one of user_id, agent_id, run_id,
-                or if threshold/top_k values are invalid.
+            ValueError: 当 filters 缺少作用域 ID，或者 threshold/top_k 非法时抛出。
         """
         if reference_date is not None:
             raise ValueError(get_temporal_feature_error_message("sync", "search", "reference_date"))
 
-        # Reject top-level entity params - must use filters instead
+        # 1) 顶层实体参数已废弃，统一要求通过 filters 传入，避免参数来源分裂。
         _reject_top_level_entity_params(kwargs, "search")
 
-        # Validate search parameters (before applying defaults)
+        # 2) 基础校验：先校验 top_k / threshold，再清洗 query 内容。
         _validate_search_params(threshold=threshold, top_k=top_k)
         query = _validate_and_trim_search_query(query)
         temporal_usage_notice = detect_temporal_usage_from_search(query, filters)
 
-        # Validate and trim entity IDs in filters
+        # 3) 规范化 filters 中的实体 ID，并保证至少有一个作用域 ID。
         effective_filters = filters.copy() if filters else {}
         if "user_id" in effective_filters:
             effective_filters["user_id"] = _validate_and_trim_entity_id(
@@ -1407,13 +1431,14 @@ class Memory(MemoryBase):
                 "Example: filters={'user_id': 'u1'}"
             )
 
+        # 4) 搜索默认返回 top_k 条，同时把 top_k 作为搜索性能提示的判断依据。
         limit = top_k
         scale_threshold_notice = detect_scale_threshold_from_top_k(top_k)
 
-        # Apply enhanced metadata filtering if advanced operators are detected
+        # 5) 如果 filters 使用了高级运算符（AND/OR/NOT、contains、gt 等），先转成向量库可识别格式。
         if self._has_advanced_operators(effective_filters):
             processed_filters = self._process_metadata_filters(effective_filters)
-            # Remove logical/operator keys that have been reprocessed
+            # 这些逻辑键已经被转译过了，避免和转译后的结果重复生效。
             for logical_key in ("AND", "OR", "NOT"):
                 effective_filters.pop(logical_key, None)
             for fk in list(effective_filters.keys()):
@@ -1421,6 +1446,7 @@ class Memory(MemoryBase):
                     effective_filters.pop(fk, None)
             effective_filters.update(processed_filters)
 
+        # 6) 埋点：记录本次搜索的过滤条件和参数，便于调试与产品分析。
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
             "mem0.search",
@@ -1437,13 +1463,14 @@ class Memory(MemoryBase):
             },
         )
 
+        # 7) 真正的检索在 _search_vector_store 里完成：语义召回 + 关键词召回 + BM25 融合。
         search_start = time.perf_counter()
         original_memories = self._search_vector_store(
             query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
-        # Apply reranking if enabled and reranker is available
+        # 8) 如果配置了 reranker，则对候选结果做二次排序，提升最终相关性。
         if rerank and self.reranker and original_memories:
             try:
                 reranked_memories = self.reranker.rerank(query, original_memories, limit)
@@ -1451,6 +1478,7 @@ class Memory(MemoryBase):
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
 
+        # 9) 根据本次搜索是否触发 temporal / 性能 / 首次使用提示，打印不同的 runtime notice。
         if temporal_usage_notice:
             display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
         elif scale_threshold_notice:
@@ -2368,38 +2396,51 @@ class AsyncMemory(MemoryBase):
         Create a new memory asynchronously.
 
         Args:
-            messages (str or List[Dict[str, str]]): Messages to store in the memory.
-            user_id (str, optional): ID of the user creating the memory.
-            agent_id (str, optional): ID of the agent creating the memory. Defaults to None.
-            run_id (str, optional): ID of the run creating the memory. Defaults to None.
-            metadata (dict, optional): Metadata to store with the memory. Defaults to None.
-            timestamp (Any, optional): Platform-only temporal parameter. Not supported in OSS.
-            expiration_date (Any, optional): Date in YYYY-MM-DD format. Expired memories are hidden
-                from search and get_all unless show_expired is True.
-            infer (bool, optional): Whether to infer the memories. Defaults to True.
-            memory_type (str, optional): Type of memory to create. Defaults to None.
-                                         Pass "procedural_memory" to create procedural memories.
-            prompt (str, optional): Prompt to use for the memory creation. Defaults to None.
-            llm (BaseChatModel, optional): LLM class to use for generating procedural memories. Defaults to None. Useful when user is using LangChain ChatModel.
+            messages (str | list[dict]): 要写入记忆的原始消息。
+                字符串、单条 dict、列表三种形态都支持，内部会统一整理。
+            user_id (str, optional): 用户作用域 ID。
+                异步版与同步版语义一致，用于隔离不同用户的记忆。
+            agent_id (str, optional): agent 作用域 ID。
+                当记忆只属于某个 agent 时使用。
+            run_id (str, optional): run / session 作用域 ID。
+                适合把单次执行过程中的记忆单独保存。
+            metadata (dict, optional): 附加元数据。
+                可携带来源、标签、业务字段等信息。
+            timestamp (Any, optional): 平台侧时间参数。
+                OSS 不支持，传入会报错。
+            expiration_date (Any, optional): 过期日期，格式通常是 `YYYY-MM-DD`。
+                过期后默认不会在检索结果中出现。
+            infer (bool, optional): 是否先让 LLM 判断再落库。
+                True 走抽取式增量记忆流程，False 则直接把消息写入。
+            memory_type (str, optional): 记忆类型。
+                传 `procedural_memory` 时会走程序性记忆分支。
+            prompt (str, optional): 自定义提示词。
+                可用于改变抽取策略或注入额外上下文。
+            llm (BaseChatModel, optional): 程序性记忆专用的 LLM。
+                适合你传入 LangChain ChatModel，自定义 procedural memory 的生成模型。
         Returns:
             dict: A dictionary containing the result of the memory addition operation.
         """
         if timestamp is not None:
             raise ValueError(await get_temporal_feature_error_message_async("async", "add", "timestamp"))
 
+        # 1) 异步版同样先处理时间/过期字段，OSS 不支持的平台字段直接拦截。
         normalized_expiration_date = _normalize_expiration_date(expiration_date)
         temporal_usage_notice = detect_temporal_usage_from_metadata(metadata)
+        # 2) 统一把 user/agent/run 作用域与 metadata 合并成有效过滤条件。
         processed_metadata, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_metadata=metadata
         )
         if normalized_expiration_date is not None:
             processed_metadata["expiration_date"] = normalized_expiration_date
 
+        # 3) 只允许 procedural_memory 走这个显式分支，其他值要尽早拒绝。
         if memory_type is not None and memory_type != MemoryType.PROCEDURAL.value:
             raise ValueError(
                 f"Invalid 'memory_type'. Please pass {MemoryType.PROCEDURAL.value} to create procedural memories."
             )
 
+        # 4) 消化消息输入形态，统一变成消息列表，后续逻辑才能复用。
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
 
@@ -2414,6 +2455,7 @@ class AsyncMemory(MemoryBase):
                 suggestion="Convert your input to a string, dictionary, or list of dictionaries."
             )
 
+        # 5) agent + procedural_memory 直接生成程序性记忆，不进入通用抽取管线。
         if agent_id is not None and memory_type == MemoryType.PROCEDURAL.value:
             results = await self._create_procedural_memory(
                 messages, metadata=processed_metadata, prompt=prompt, llm=llm
@@ -2427,11 +2469,13 @@ class AsyncMemory(MemoryBase):
                 await display_first_run_notice_async(self, "async", "add")
             return results
 
+        # 6) 多模态消息先转成统一结构，再进入向量化与 LLM 抽取流程。
         if self.config.llm.config.get("enable_vision"):
             messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
         else:
             messages = parse_vision_messages(messages)
 
+        # 7) 统一走异步版增量抽取管线：LLM 抽取、批量 embedding、去重、写库。
         vector_store_result = await self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, prompt=prompt)
         scale_threshold_notice = await asyncio.to_thread(detect_scale_threshold_from_add_result, self, vector_store_result)
         if temporal_usage_notice:
@@ -2451,6 +2495,7 @@ class AsyncMemory(MemoryBase):
         prompt: Optional[str] = None,
     ):
         if not infer:
+            # 非推理模式：逐条消息直接写记忆，保持和同步版一致的语义。
             returned_memories = []
             for message_dict in messages:
                 if (
@@ -2488,12 +2533,12 @@ class AsyncMemory(MemoryBase):
 
         # === V3 PHASED BATCH PIPELINE (async) ===
 
-        # Phase 0: Context gathering
+        # Phase 0: 收集上下文
         session_scope = _build_session_scope(effective_filters)
         last_messages = await asyncio.to_thread(self.db.get_last_messages, session_scope, 10)
         parsed_messages = parse_messages(messages)
 
-        # Phase 1: Existing memory retrieval
+        # Phase 1: 先召回已有记忆，作为 LLM 判断“新增/更新/删除”的参照。
         search_filters = {k: v for k, v in effective_filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         query_embedding = await asyncio.to_thread(self.embedding_model.embed, parsed_messages, "search")
         existing_results = await asyncio.to_thread(
@@ -2504,19 +2549,20 @@ class AsyncMemory(MemoryBase):
             filters=search_filters,
         )
 
-        # Map UUIDs to integers (anti-hallucination)
+        # 把真实 UUID 映射成短数字 ID，减少 LLM 输出与真实数据结构耦合。
         existing_memories = []
         uuid_mapping = {}
         for idx, mem in enumerate(existing_results):
             uuid_mapping[str(idx)] = mem.id
             existing_memories.append({"id": str(idx), "text": mem.payload.get("data", "")})
 
-        # Phase 2: LLM extraction (single call)
+        # Phase 2: 单次 LLM 抽取
         is_agent_scoped = bool(effective_filters.get("agent_id")) and not effective_filters.get("user_id")
         system_prompt = ADDITIVE_EXTRACTION_PROMPT
         if is_agent_scoped:
             system_prompt += AGENT_CONTEXT_SUFFIX
 
+        # 外部传入 prompt 优先，否则使用实例级 custom_instructions。
         custom_instr = prompt or self.custom_instructions
 
         user_prompt = generate_additive_extraction_prompt(
@@ -2539,7 +2585,7 @@ class AsyncMemory(MemoryBase):
             logger.error(f"LLM extraction failed (async): {e}")
             return []
 
-        # Parse response
+        # 解析返回：优先按 JSON 读，失败则尝试从文本里再抓一次。
         try:
             response = remove_code_blocks(response)
             if not response or not response.strip():
@@ -2555,15 +2601,17 @@ class AsyncMemory(MemoryBase):
             extracted_memories = []
 
         if not extracted_memories:
+            # 没抽到任何记忆也要保存消息历史，避免上下文丢失。
             await asyncio.to_thread(self.db.save_messages, messages, session_scope)
             return []
 
-        # Phase 3: Batch embed all extracted memory texts
+        # Phase 3: 批量 embedding
         mem_texts = [m.get("text", "") for m in extracted_memories if m.get("text")]
         try:
             mem_embeddings_list = await asyncio.to_thread(self.embedding_model.embed_batch, mem_texts, "add")
             embed_map = dict(zip(mem_texts, mem_embeddings_list))
         except Exception:
+            # 批处理失败时逐条补救，保证最终结果尽量完整。
             embed_map = {}
             for text in mem_texts:
                 try:
@@ -2571,7 +2619,7 @@ class AsyncMemory(MemoryBase):
                 except Exception as e:
                     logger.warning(f"Failed to embed memory text (async): {e}")
 
-        # Phase 4: Per-memory CPU processing + Phase 5: Hash dedup
+        # Phase 4/5: 哈希去重 + 逐条组织最终写入记录。
         existing_hashes = set()
         for mem in existing_results:
             h = mem.payload.get("hash") if hasattr(mem, "payload") and mem.payload else None
@@ -2585,12 +2633,14 @@ class AsyncMemory(MemoryBase):
             if not text or text not in embed_map:
                 continue
 
+            # 已存在或本批次重复的文本，直接跳过。
             mem_hash = hashlib.md5(text.encode()).hexdigest()
             if mem_hash in existing_hashes or mem_hash in seen_hashes:
                 logger.debug(f"Skipping duplicate memory (hash match, async): {text[:50]}")
                 continue
             seen_hashes.add(mem_hash)
 
+            # 组装最终元数据：原文、词形归一、hash、时间戳、归因信息。
             text_lemmatized = lemmatize_for_bm25(text)
 
             memory_id = str(uuid.uuid4())
@@ -2961,11 +3011,13 @@ class AsyncMemory(MemoryBase):
         Searches for memories based on a query.
 
         Args:
-            query (str): Query to search for.
-            top_k (int, optional): Maximum number of results to return. Defaults to 20.
-            filters (dict): Filter dict containing entity IDs and optional metadata filters.
-                Must contain at least one of: user_id, agent_id, run_id.
-                Example: filters={"user_id": "u1", "agent_id": "a1"}
+            query (str): 搜索词。
+                会被同时用于语义检索和关键词检索。
+            top_k (int, optional): 最多返回多少条结果。
+                影响最终结果数量和内部候选池大小。
+            filters (dict): 过滤条件字典。
+                必须包含 `user_id` / `agent_id` / `run_id` 之一。
+                还可以叠加额外元数据条件，例如 `{"user_id": "u1", "tag": "work"}`。
 
                 Enhanced metadata filtering with operators:
                 - {"key": "value"} - exact match
@@ -2983,34 +3035,38 @@ class AsyncMemory(MemoryBase):
                 - {"AND": [filter1, filter2]} - logical AND
                 - {"OR": [filter1, filter2]} - logical OR
                 - {"NOT": [filter1]} - logical NOT
-            threshold (float, optional): Minimum score for a memory to be included. Defaults to 0.1.
-            rerank (bool, optional): Whether to rerank results. Defaults to False.
-            explain (bool, optional): Whether to include score_details for each result. Defaults to False.
-            reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
-            show_expired (bool, optional): Include expired memories. Defaults to False.
+            threshold (float, optional): 最低得分阈值。
+                低于该值的候选结果会被过滤掉。
+            rerank (bool, optional): 是否启用 reranker。
+                开启后会用重排器对初筛结果再排序。
+            explain (bool, optional): 是否返回打分解释。
+                方便调试召回为什么命中。
+            reference_date (Any, optional): 平台侧时间参数。
+                OSS 版本不支持。
+            show_expired (bool, optional): 是否包含过期记忆。
+                默认 False。
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}`
 
         Raises:
-            ValueError: If filters doesn't contain at least one of user_id, agent_id, run_id,
-                or if threshold/top_k values are invalid.
+            ValueError: 当 filters 缺少作用域 ID，或者 threshold/top_k 非法时抛出。
         """
         if reference_date is not None:
             raise ValueError(
                 await get_temporal_feature_error_message_async("async", "search", "reference_date")
             )
 
-        # Reject top-level entity params - must use filters instead
+        # 1) 统一要求通过 filters 传实体参数，避免旧参数位和新参数位并存。
         _reject_top_level_entity_params(kwargs, "search")
 
-        # Validate search parameters (before applying defaults)
+        # 2) 搜索参数校验：先保证 top_k / threshold 合法，再清理 query。
         _validate_search_params(threshold=threshold, top_k=top_k)
         query = _validate_and_trim_search_query(query)
         temporal_usage_notice = detect_temporal_usage_from_search(query, filters)
 
-        # Validate and trim entity IDs in filters
+        # 3) 规范化过滤器中的实体 ID，并要求至少存在一个作用域。
         effective_filters = filters.copy() if filters else {}
         if "user_id" in effective_filters:
             effective_filters["user_id"] = _validate_and_trim_entity_id(
@@ -3032,13 +3088,14 @@ class AsyncMemory(MemoryBase):
                 "Example: filters={'user_id': 'u1'}"
             )
 
+        # 4) top_k 既是返回条数，也是性能提示阈值的参考。
         limit = top_k
         scale_threshold_notice = detect_scale_threshold_from_top_k(top_k)
 
-        # Apply enhanced metadata filtering if advanced operators are detected
+        # 5) 高级过滤器（AND/OR/NOT/比较运算符）先转译成向量库可识别格式。
         if self._has_advanced_operators(effective_filters):
             processed_filters = self._process_metadata_filters(effective_filters)
-            # Remove logical/operator keys that have been reprocessed
+            # 已经转译过的逻辑键删掉，避免重复解释。
             for logical_key in ("AND", "OR", "NOT"):
                 effective_filters.pop(logical_key, None)
             for fk in list(effective_filters.keys()):
@@ -3046,6 +3103,7 @@ class AsyncMemory(MemoryBase):
                     effective_filters.pop(fk, None)
             effective_filters.update(processed_filters)
 
+        # 6) 记录一次搜索埋点，方便排查过滤条件、耗时和召回情况。
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
             "mem0.search",
@@ -3062,16 +3120,16 @@ class AsyncMemory(MemoryBase):
             },
         )
 
+        # 7) 异步搜索同样走“语义召回 + 关键词召回 + BM25 融合”的统一检索管线。
         search_start = time.perf_counter()
         original_memories = await self._search_vector_store(
             query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
-        # Apply reranking if enabled and reranker is available
+        # 8) 可选 rerank：如果配置了重排器，则再做一次相关性排序。
         if rerank and self.reranker and original_memories:
             try:
-                # Run reranking in thread pool to avoid blocking async loop
                 reranked_memories = await asyncio.to_thread(
                     self.reranker.rerank, query, original_memories, limit
                 )
@@ -3079,6 +3137,7 @@ class AsyncMemory(MemoryBase):
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
 
+        # 9) 按不同情况输出运行提示：temporal / 性能慢查询 / 首次运行。
         if temporal_usage_notice:
             await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)
         elif scale_threshold_notice:
