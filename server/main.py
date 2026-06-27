@@ -4,6 +4,10 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import telemetry
 from auth import ADMIN_API_KEY, AUTH_DISABLED, JWT_SECRET, require_admin, verify_auth
 from db import SessionLocal
@@ -38,8 +42,6 @@ from server_state import (
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import func, select
-
-load_dotenv()
 
 install_request_id_logging()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(request_id)s] %(message)s")
@@ -114,7 +116,18 @@ POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
 DEFAULT_LLM_MODEL = os.environ.get("MEM0_DEFAULT_LLM_MODEL", "gpt-4.1-nano-2025-04-14")
+DEFAULT_LLM_BASE_URL = os.environ.get("MEM0_DEFAULT_LLM_BASE_URL")
 DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL", "text-embedding-3-small")
+DEFAULT_EMBEDDER_BASE_URL = os.environ.get("MEM0_DEFAULT_EMBEDDER_BASE_URL")
+EMBEDDER_API_KEY = os.environ.get("MEM0_DEFAULT_EMBEDDER_API_KEY", OPENAI_API_KEY)
+
+_llm_config: dict = {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL}
+if DEFAULT_LLM_BASE_URL:
+    _llm_config["openai_base_url"] = DEFAULT_LLM_BASE_URL
+
+_embedder_config: dict = {"api_key": EMBEDDER_API_KEY, "model": DEFAULT_EMBEDDER_MODEL}
+if DEFAULT_EMBEDDER_BASE_URL:
+    _embedder_config["openai_base_url"] = DEFAULT_EMBEDDER_BASE_URL
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -131,9 +144,9 @@ DEFAULT_CONFIG = {
     },
     "llm": {
         "provider": "openai",
-        "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
+        "config": _llm_config,
     },
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": DEFAULT_EMBEDDER_MODEL}},
+    "embedder": {"provider": "openai", "config": _embedder_config},
     "history_db_path": HISTORY_DB_PATH,
 }
 
