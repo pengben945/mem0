@@ -749,10 +749,22 @@ def _extract_entities_from_doc(doc) -> list[tuple[str, str]]:
 
 
 def extract_entities(text: str) -> list[tuple[str, str]]:
-    """Extract typed entity candidates from text."""
+    """
+    从输入文本中抽取实体，返回结构化的 `(entity_type, entity_text)` 列表。
+
+    处理流程：
+    1. 获取全功能 spaCy 模型（包含 NER 等管线）；
+    2. 模型不可用时返回空列表（容错，不阻断主流程）；
+    3. 对文本执行 nlp 解析，并交给 `_extract_entities_from_doc` 做候选生成与去重。
+
+    Returns:
+        list[tuple[str, str]]: 去重后的实体列表，常见类型包括
+        `PROPER`、`QUOTED`、`TOPIC`、`IDENTIFIER`。
+    """
     from mem0.utils.spacy_models import get_nlp_full
 
     nlp = get_nlp_full()
+    # 未安装或加载失败时走降级路径：不做实体增强，但保持检索/写入主流程可用。
     if nlp is None:
         return []
     return _extract_entities_from_doc(nlp(text))

@@ -287,47 +287,43 @@ def _build_filters_and_metadata(
     input_filters: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Constructs metadata for storage and filters for querying based on session and actor identifiers.
+    根据会话作用域和 actor 信息，构造“写入用 metadata”和“查询用 filters”。
 
-    This helper supports multiple session identifiers (`user_id`, `agent_id`, and/or `run_id`)
-    for flexible session scoping and optionally narrows queries to a specific `actor_id`. It returns two dicts:
+    这个方法的核心作用是把输入拆成两份：
 
-    1. `base_metadata_template`: Used as a template for metadata when storing new memories.
-       It includes all provided session identifier(s) and any `input_metadata`.
-    2. `effective_query_filters`: Used for querying existing memories. It includes all
-       provided session identifier(s), any `input_filters`, and a resolved actor
-       identifier for targeted filtering if specified by any actor-related inputs.
+    1. `base_metadata_template`：给后续写入记忆时使用的元数据模板。
+       它会保留传入的 `input_metadata`，并补上 `user_id` / `agent_id` / `run_id`。
+    2. `effective_query_filters`：给后续查询已有记忆时使用的过滤条件。
+       它会保留传入的 `input_filters`，并补上同样的作用域字段。
 
-    Actor filtering precedence: explicit `actor_id` arg → `filters["actor_id"]`
-    This resolved actor ID is used for querying but is not added to `base_metadata_template`,
-    as the actor for storage is typically derived from message content at a later stage.
+    如果同时传了 `actor_id`，它会作为额外的查询过滤条件附加进去。
+    这个 `actor_id` 只用于查询，不会写回到 `base_metadata_template`，
+    因为存储侧的 actor 往往会在后续消息解析阶段再确定。
 
     Args:
-        user_id (Optional[str]): User identifier, for session scoping.
-        agent_id (Optional[str]): Agent identifier, for session scoping.
-        run_id (Optional[str]): Run identifier, for session scoping.
-        actor_id (Optional[str]): Explicit actor identifier, used as a potential source for
-            actor-specific filtering. See actor resolution precedence in the main description.
-        input_metadata (Optional[Dict[str, Any]]): Base dictionary to be augmented with
-            session identifiers for the storage metadata template. Defaults to an empty dict.
-        input_filters (Optional[Dict[str, Any]]): Base dictionary to be augmented with
-            session and actor identifiers for query filters. Defaults to an empty dict.
+        user_id (Optional[str]): 用户作用域 ID，用来隔离不同用户的记忆。
+        agent_id (Optional[str]): Agent 作用域 ID，用来隔离某个 agent 的记忆。
+        run_id (Optional[str]): 运行/会话作用域 ID，用来隔离某次执行过程的记忆。
+        actor_id (Optional[str]): 显式指定的 actor ID。
+            如果传入，会作为额外的查询过滤条件使用。
+        input_metadata (Optional[Dict[str, Any]]): 写入时要携带的基础元数据。
+            这里会被拷贝后再补充作用域字段，避免直接修改外部对象。
+        input_filters (Optional[Dict[str, Any]]): 查询时要携带的基础过滤条件。
+            这里也会被拷贝后再补充作用域字段和 actor 条件。
 
     Returns:
-        tuple[Dict[str, Any], Dict[str, Any]]: A tuple containing:
-            - base_metadata_template (Dict[str, Any]): Metadata template for storing memories,
-              scoped to the provided session(s).
-            - effective_query_filters (Dict[str, Any]): Filters for querying memories,
-              scoped to the provided session(s) and potentially a resolved actor.
+        tuple[Dict[str, Any], Dict[str, Any]]: 返回两个字典：
+            - `base_metadata_template`：写入记忆时使用的元数据模板。
+            - `effective_query_filters`：查询已有记忆时使用的最终过滤条件。
     """
 
     base_metadata_template = deepcopy(input_metadata) if input_metadata else {}
     effective_query_filters = deepcopy(input_filters) if input_filters else {}
 
-    # ---------- validate and add all provided session ids ----------
+    # ---------- 校验并写入所有传入的作用域 ID ----------
     session_ids_provided = []
 
-    # Validate and trim entity IDs
+    # 先统一清理 ID：去掉首尾空白，并拒绝空字符串/含空格的非法值。
     user_id = _validate_and_trim_entity_id(user_id, "user_id")
     agent_id = _validate_and_trim_entity_id(agent_id, "agent_id")
     run_id = _validate_and_trim_entity_id(run_id, "run_id")
@@ -355,7 +351,8 @@ def _build_filters_and_metadata(
             suggestion="Please provide at least one identifier to scope the memory operation."
         )
 
-    # ---------- optional actor filter ----------
+    # ---------- 可选的 actor 过滤 ----------
+    # actor_id 的优先级：显式传入的 actor_id > input_filters 里的 actor_id。
     resolved_actor_id = actor_id or effective_query_filters.get("actor_id")
     if resolved_actor_id:
         effective_query_filters["actor_id"] = resolved_actor_id
@@ -364,7 +361,13 @@ def _build_filters_and_metadata(
 
 
 def _build_session_scope(filters):
-    """Build deterministic session scope string from entity IDs."""
+    """
+    把过滤条件里的实体 ID 拼成一个确定性的会话作用域字符串。
+
+    比如 {"user_id": "alice", "agent_id": "bot"} → "agent_id=bot&user_id=alice"。
+    固定按字母序排序，保证同一批过滤条件无论传入顺序如何，都能生成相同的 scope key，
+    用于 SQLite 历史记录和消息上下文的存取。
+    """
     parts = []
     for key in sorted(["user_id", "agent_id", "run_id"]):
         val = filters.get(key)
@@ -374,11 +377,27 @@ def _build_session_scope(filters):
 
 
 def _entity_collection_name(provider: str, collection_name: str) -> str:
+    """
+    根据向量库 provider 和主 collection 名称，生成实体库的 collection 名称。
+
+    s3_vectors 用连字符（AWS S3 不允许下划线），其他向量库统一用下划线分隔。
+    例如 ("pgvector", "mem0_memories") → "mem0_memories_entities"
+    """
     separator = "-" if provider == "s3_vectors" else "_"
     return f"{collection_name}{separator}entities"
 
 
 def _normalize_expiration_date(value: Any) -> Optional[str]:
+    """
+    把各种形态的过期时间归一化成 YYYY-MM-DD 字符串。
+
+    支持三种输入格式：
+    - datetime 对象：取 .date() 后转字符串
+    - date 对象：直接转字符串
+    - str：尝试按 ISO 格式解析，失败则抛 ValueError
+
+    返回 None 表示不设置过期时间（透传 None）。
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -394,6 +413,14 @@ def _normalize_expiration_date(value: Any) -> Optional[str]:
 
 
 def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
+    """
+    判断一条记忆的 payload 是否已过期。
+
+    读取 payload 里的 `expiration_date` 字段（YYYY-MM-DD 格式），
+    与当前 UTC 日期做比较，早于今天则视为过期。
+    - payload 为空、或不含 expiration_date，视为永不过期，返回 False。
+    - 日期格式无法解析时，同样返回 False（容错处理）。
+    """
     if not payload:
         return False
     expiration_date = payload.get("expiration_date")
@@ -559,10 +586,24 @@ class Memory(MemoryBase):
         return rows_by_text
 
     def _upsert_entity(self, entity_text, entity_type, memory_id, filters):
-        """Upsert an entity into the entity store, linking it to a memory."""
+        """
+        把一个实体写入实体库，并将其与指定的 memory_id 关联。
+
+        查找逻辑（按优先级）：
+        1. 精确匹配：先在本地缓存的实体列表里按规范化文本查找，避免重复向量搜索。
+        2. 语义匹配：精确匹配未命中时，执行向量相似度搜索，相似度 >= 0.95 视为同一实体。
+
+        匹配到已有实体 → 将 memory_id 追加到 linked_memory_ids，更新 payload。
+        未匹配到 → 新建实体记录，payload 包含 data/entity_type/linked_memory_ids 和作用域字段。
+
+        任何异常均以 warning 级别记录并吞掉，不影响主流程。
+        """
         try:
+            # 生成实体的向量表示，用于后续语义检索
             entity_embedding = self.embedding_model.embed(entity_text, "add")
+            # 只保留有效的作用域字段，用于过滤隔离（不同 user/agent/run 的实体互不影响）
             search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+            # 先尝试精确文本匹配（O(1) 缓存查找，避免每次向量搜索）
             exact_match = self._existing_entities_by_text(search_filters).get(self._normalize_entity_text(entity_text))
 
             existing = []
@@ -606,20 +647,23 @@ class Memory(MemoryBase):
             logger.warning(f"Entity upsert failed for '{entity_text}': {e}")
 
     def _remove_memory_from_entity_store(self, memory_id, filters):
-        """Strip `memory_id` from every entity record scoped to `filters`.
+        """
+        从实体库中移除指定 memory_id 的所有关联关系。
 
-        For each entity whose `linked_memory_ids` contains `memory_id`:
-          - remove the id; if the list becomes empty, delete the entity record.
-          - otherwise re-embed the entity text and update the payload
-            (the vector store's update() requires a vector).
+        遍历当前作用域（user_id/agent_id/run_id）下的全部实体：
+        - 若实体的 linked_memory_ids 包含 memory_id：
+          - 移除后链接列表为空 → 直接删除该实体记录（孤立实体无保留价值）
+          - 链接列表仍有其他记忆 → 重新 embed 实体文本并更新 payload
+            （更新向量库时必须同时提供新向量，不能只更新 payload）
 
-        No-op if the entity store has never been initialized in this process.
-        Errors on individual entities are swallowed at debug level; outer
-        failures are swallowed at warning level so the primary delete/update
-        path is never broken by entity cleanup.
+        设计原则：
+        - 实体库未初始化（self._entity_store is None）时静默跳过
+        - 单条实体的操作失败以 debug 级别记录，不中断整个清理循环
+        - 外层异常以 warning 级别记录，永远不影响主删除/更新流程
         """
         if self._entity_store is None:
             return
+        # 只使用作用域相关字段做过滤，避免误操作其他 user/agent 的实体
         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         try:
             listed = self.entity_store.list(filters=search_filters, top_k=10000)
@@ -661,10 +705,15 @@ class Memory(MemoryBase):
             logger.warning(f"Entity store cleanup failed for memory_id={memory_id}: {e}")
 
     def _link_entities_for_memory(self, memory_id, text, filters):
-        """Extract entities from `text` and link them to `memory_id` in the
-        entity store, scoped to `filters`. Simpler single-memory variant of
-        Phase 7 in add(): per-entity search-then-update-or-insert via the
-        existing `_upsert_entity` helper. Non-fatal on any failure.
+        """
+        从 text 中提取实体，并将它们与 memory_id 关联写入实体库。
+
+        这是 add() Phase 7 的单记忆简化版本：
+        1. 调用 extract_entities() 从文本中识别实体（类型 + 文本）
+        2. 对每个唯一实体调用 _upsert_entity() 建立关联
+        3. 用规范化文本去重（seen set），避免同名实体重复写入
+        4. 任何单个实体的关联失败以 debug 级别记录，不影响其他实体
+        5. 整体失败以 warning 级别记录，永远不影响主流程
         """
         try:
             entities = extract_entities(text)
@@ -773,6 +822,10 @@ class Memory(MemoryBase):
 
         # 1) 先把时间/过期时间等平台能力做拦截与归一化，OSS 只保留支持的那部分。
         normalized_expiration_date = _normalize_expiration_date(expiration_date)
+        # 1b) 探测 metadata 中是否携带了时间/日期语义的字段（key 名如date/timestamp/created_at，
+        #     值如ISO格式、相对时间词、Unix时间戳等）。如果命中，OSS 不会报错（与 timestamp 参数不同），
+        #     而是返回一个标记，后续通过 display_temporal_usage_notice 引导用户了解平台侧的时间功能。
+        #     这不是硬拦截，只是"软性提示"：OSS 不支持时间语义，但 SDK 会尽量告知用户替代方案。
         temporal_usage_notice = detect_temporal_usage_from_metadata(metadata)
         # 2) 统一构造元数据和作用域过滤条件：user_id / agent_id / run_id 会被折叠进同一套过滤器里。
         processed_metadata, effective_filters = _build_filters_and_metadata(
@@ -838,6 +891,19 @@ class Memory(MemoryBase):
         return {"results": vector_store_result}
 
     def _add_to_vector_store(self, messages, metadata, filters, infer, prompt=None):
+        """
+        将输入消息转成可持久化的记忆，并写入向量库/历史库（同步版）。
+
+        Args:
+            messages (list): 原始对话消息列表（role/content/name 等字段）。
+            metadata (dict): 基础元数据模板，会按消息或动作扩展后写入 payload。
+            filters (dict): 作用域过滤条件（如 user_id/agent_id/run_id）。
+            infer (bool): 是否启用 LLM 推理抽取。False 时直接逐条写入消息文本。
+            prompt (str, optional): 自定义抽取提示词，优先级高于实例级 custom_instructions。
+
+        Returns:
+            list: 记忆变更结果列表（ADD/UPDATE/DELETE 等动作）。
+        """
         if not infer:
             # 非推理模式：把每条用户消息直接当成一条记忆写入，不做 LLM 抽取。
             returned_memories = []
@@ -880,7 +946,9 @@ class Memory(MemoryBase):
         # Phase 0: 上下文采集
         # 先取最近对话历史，再让 LLM 在“当前输入 + 历史上下文”里判断该新增/更新/删除什么。
         session_scope = _build_session_scope(filters)
+        # 从历史库取最近 10 条上下文，帮助 LLM 做“增量判断”而不是脱离上下文地抽取
         last_messages = self.db.get_last_messages(session_scope, limit=10)
+        # 把结构化消息拼成统一文本，作为向量检索 query 和抽取提示词输入
         parsed_messages = parse_messages(messages)
 
         # Phase 1: 召回已有记忆
@@ -1601,29 +1669,55 @@ class Memory(MemoryBase):
         return False
 
     def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, show_expired=False):
-        # Guard against None threshold (backward compat)
+        """
+        执行统一检索管线（同步版）：语义召回 + 关键词召回 + 实体增强 + 融合重排。
+
+        该方法是 search() 的核心执行器，整体流程：
+        1. 预处理 query（词形还原 + 实体抽取）
+        2. 语义向量召回（过采样）
+        3. 关键词 BM25 召回并分数归一化
+        4. 基于实体库计算 entity boost
+        5. 融合打分（semantic + bm25 + entity）并按阈值/limit 截断
+        6. 输出标准 MemoryItem 结构
+
+        Args:
+            query (str): 用户查询文本。
+            filters (dict): 作用域与元数据过滤条件。
+            limit (int): 最终返回条数上限。
+            threshold (float, optional): 融合后最低分阈值；None 时回退到 0.1。
+            explain (bool, optional): 是否输出 score_details 解释字段。
+            show_expired (bool, optional): 是否包含过期记忆。
+
+        Returns:
+            list[dict]: 标准化后的记忆结果列表。
+        """
+        # 兼容旧调用方：threshold 可能显式传 None。
         if threshold is None:
             threshold = 0.1
 
-        # Step 1: Preprocess query
+        # Step 1) Query 预处理
+        # - lemmatize_for_bm25: 为关键词检索准备统一词形
+        # - extract_entities: 提取实体，后续用于实体相关性加权
         query_lemmatized = lemmatize_for_bm25(query)
         query_entities = extract_entities(query)
 
-        # Step 2: Embed query
+        # Step 2) 计算 query 向量（semantic 搜索输入）
         embeddings = self.embedding_model.embed(query, "search")
 
-        # Step 3: Semantic search (over-fetch for scoring pool)
+        # Step 3) 语义召回（过采样）
+        # internal_limit > limit：先多取候选，给后续融合排序留空间，避免早截断误杀。
         internal_limit = max(limit * 4, 60)
         semantic_results = self.vector_store.search(
             query=query, vectors=embeddings, top_k=internal_limit, filters=filters
         )
 
-        # Step 4: Keyword search (if store supports it)
+        # Step 4) 关键词召回（走向量库的 keyword_search 能力，若实现支持）
         keyword_results = self.vector_store.keyword_search(
             query=query_lemmatized, top_k=internal_limit, filters=filters
         )
 
-        # Step 5: Compute BM25 scores from keyword results
+        # Step 5) BM25 分数标准化
+        # 不同向量库/检索器原始分值尺度不同，统一归一化后再参与融合。
         bm25_scores = {}
         if keyword_results is not None:
             midpoint, steepness = get_bm25_params(query, lemmatized=query_lemmatized)
@@ -1633,12 +1727,14 @@ class Memory(MemoryBase):
                 if raw_score and raw_score > 0:
                     bm25_scores[mem_id] = normalize_bm25(raw_score, midpoint, steepness)
 
-        # Step 6: Compute entity boosts
+        # Step 6) 实体增强分
+        # 当 query 命中实体（人名/组织/地点等）时，优先提升与这些实体关联的记忆。
         entity_boosts = {}
         if query_entities:
             entity_boosts = self._compute_entity_boosts(query_entities, filters)
 
-        # Step 7: Build candidate set from semantic results
+        # Step 7) 构造融合候选集（来自 semantic 召回）
+        # show_expired=False 时先过滤掉已过期记忆，避免进入后续排序。
         candidates = []
         for mem in semantic_results:
             payload = mem.payload if hasattr(mem, 'payload') else {}
@@ -1651,7 +1747,8 @@ class Memory(MemoryBase):
                 "payload": payload,
             })
 
-        # Step 8: Score and rank
+        # Step 8) 融合打分与重排
+        # score_and_rank 内部会按权重组合 semantic / bm25 / entity 分数，并应用阈值和 top_k。
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
@@ -1661,7 +1758,10 @@ class Memory(MemoryBase):
             explain=explain,
         )
 
-        # Step 9: Format results
+        # Step 9) 输出格式标准化
+        # - 核心字段提升到顶层（id/memory/hash/time/score 等）
+        # - 其余 payload 字段收拢到 metadata，避免顶层字段污染
+        # - explain=True 时附带 score_details，便于调参与排障
         promoted_payload_keys = [
             "user_id",
             "agent_id",
@@ -1907,7 +2007,21 @@ class Memory(MemoryBase):
         return history
 
     def _create_memory(self, data, existing_embeddings, metadata=None):
+        """
+        创建一条新的记忆并写入向量库，同时记录历史变更。
+
+        Args:
+            data (str): 要写入记忆的文本内容。
+            existing_embeddings (dict): 预先计算好的 embedding 缓存，key 为文本，value 为向量。
+                命中缓存时可跳过重复 embedding 计算。
+            metadata (dict, optional): 要附加到记忆 payload 的元数据。
+                会在内部补齐 data/hash/created_at/updated_at/text_lemmatized 等字段。
+
+        Returns:
+            str: 新创建的 memory_id（UUID）。
+        """
         logger.debug(f"Creating memory with {data=}")
+        # 优先复用上游阶段已算好的向量，减少一次模型调用
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
@@ -1919,6 +2033,7 @@ class Memory(MemoryBase):
         if "created_at" not in new_metadata:
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
+        # 预计算词形还原文本，供 BM25 检索使用
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
 
         self.vector_store.insert(
@@ -2494,6 +2609,19 @@ class AsyncMemory(MemoryBase):
         infer: bool,
         prompt: Optional[str] = None,
     ):
+        """
+        将输入消息转成可持久化的记忆，并写入向量库/历史库（异步版）。
+
+        Args:
+            messages (list): 原始对话消息列表（role/content/name 等字段）。
+            metadata (dict): 基础元数据模板，会按消息或动作扩展后写入 payload。
+            effective_filters (dict): 作用域过滤条件（如 user_id/agent_id/run_id）。
+            infer (bool): 是否启用 LLM 推理抽取。False 时直接逐条写入消息文本。
+            prompt (str, optional): 自定义抽取提示词，优先级高于实例级 custom_instructions。
+
+        Returns:
+            list: 记忆变更结果列表（ADD/UPDATE/DELETE 等动作）。
+        """
         if not infer:
             # 非推理模式：逐条消息直接写记忆，保持和同步版一致的语义。
             returned_memories = []
@@ -2535,7 +2663,9 @@ class AsyncMemory(MemoryBase):
 
         # Phase 0: 收集上下文
         session_scope = _build_session_scope(effective_filters)
+        # 在线程池中读取最近 10 条历史上下文，避免阻塞事件循环
         last_messages = await asyncio.to_thread(self.db.get_last_messages, session_scope, 10)
+        # 把结构化消息拼成统一文本，作为向量检索 query 和抽取提示词输入
         parsed_messages = parse_messages(messages)
 
         # Phase 1: 先召回已有记忆，作为 LLM 判断“新增/更新/删除”的参照。
@@ -3260,28 +3390,35 @@ class AsyncMemory(MemoryBase):
         return False
 
     async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, show_expired=False):
+        """
+        执行统一检索管线（异步版）：语义召回 + 关键词召回 + 实体增强 + 融合重排。
+
+        与同步版逻辑一致，区别在于：
+        - CPU/IO 可能阻塞的步骤通过 asyncio.to_thread 下沉到线程池
+        - 实体增强阶段使用异步并发（受 semaphore 限流）
+        """
         if threshold is None:
             threshold = 0.1
 
-        # Step 1: Preprocess query (CPU-bound)
+        # Step 1) Query 预处理（CPU-bound，放线程池）
         query_lemmatized = await asyncio.to_thread(lemmatize_for_bm25, query)
         query_entities = await asyncio.to_thread(extract_entities, query)
 
-        # Step 2: Embed query
+        # Step 2) 计算 query 向量
         embeddings = await asyncio.to_thread(self.embedding_model.embed, query, "search")
 
-        # Step 3: Semantic search (over-fetch)
+        # Step 3) 语义召回（过采样）
         internal_limit = max(limit * 4, 60)
         semantic_results = await asyncio.to_thread(
             self.vector_store.search, query=query, vectors=embeddings, top_k=internal_limit, filters=filters
         )
 
-        # Step 4: Keyword search (if store supports it)
+        # Step 4) 关键词召回（若向量库实现支持）
         keyword_results = await asyncio.to_thread(
             self.vector_store.keyword_search, query=query_lemmatized, top_k=internal_limit, filters=filters
         )
 
-        # Step 5: Compute BM25 scores
+        # Step 5) BM25 分数标准化
         bm25_scores = {}
         if keyword_results is not None:
             midpoint, steepness = get_bm25_params(query, lemmatized=query_lemmatized)
@@ -3291,12 +3428,12 @@ class AsyncMemory(MemoryBase):
                 if raw_score and raw_score > 0:
                     bm25_scores[mem_id] = normalize_bm25(raw_score, midpoint, steepness)
 
-        # Step 6: Compute entity boosts
+        # Step 6) 实体增强分（异步并发版本）
         entity_boosts = {}
         if query_entities:
             entity_boosts = await self._compute_entity_boosts_async(query_entities, filters)
 
-        # Step 7: Build candidate set from semantic results
+        # Step 7) 构造候选并过滤过期数据
         candidates = []
         for mem in semantic_results:
             payload = mem.payload if hasattr(mem, 'payload') else {}
@@ -3309,7 +3446,7 @@ class AsyncMemory(MemoryBase):
                 "payload": payload,
             })
 
-        # Step 8: Score and rank
+        # Step 8) 融合打分与重排
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
@@ -3319,7 +3456,7 @@ class AsyncMemory(MemoryBase):
             explain=explain,
         )
 
-        # Step 9: Format results
+        # Step 9) 标准化输出结构（与同步版保持一致）
         promoted_payload_keys = [
             "user_id",
             "agent_id",
@@ -3569,7 +3706,21 @@ class AsyncMemory(MemoryBase):
         return history
 
     async def _create_memory(self, data, existing_embeddings, metadata=None):
+        """
+        异步创建一条新的记忆并写入向量库，同时记录历史变更。
+
+        Args:
+            data (str): 要写入记忆的文本内容。
+            existing_embeddings (dict): 预先计算好的 embedding 缓存，key 为文本，value 为向量。
+                命中缓存时可跳过重复 embedding 计算。
+            metadata (dict, optional): 要附加到记忆 payload 的元数据。
+                会在内部补齐 data/hash/created_at/updated_at/text_lemmatized 等字段。
+
+        Returns:
+            str: 新创建的 memory_id（UUID）。
+        """
         logger.debug(f"Creating memory with {data=}")
+        # 优先复用缓存向量；未命中时在线程池中执行 embedding，避免阻塞事件循环
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
@@ -3582,6 +3733,7 @@ class AsyncMemory(MemoryBase):
         if "created_at" not in new_metadata:
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
+        # 预计算词形还原文本，供 BM25 检索使用
         new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
 
         await asyncio.to_thread(

@@ -1025,14 +1025,31 @@ def generate_additive_extraction_prompt(
     custom_instructions=None,
     use_input_language=False,
 ):
-    """Build the user prompt for additive (ADD-only) extraction with linking.
+    """
+    生成“增量记忆抽取（仅 ADD）”阶段给 LLM 的用户提示词。
 
-    Pairs with ADDITIVE_EXTRACTION_PROMPT system prompt.
-    The LLM will produce only ADD operations, with optional linked_memory_ids.
+    该提示词与 `ADDITIVE_EXTRACTION_PROMPT` 系统提示配套使用：
+    - 模型只允许产出 ADD 操作（不做 UPDATE/DELETE）
+    - 可在结果中返回 `linked_memory_ids`，用于与已有记忆建立关联
+
+    Args:
+        summary (str, optional): 上游生成的对话摘要。
+        recently_extracted_memories (list, optional): 最近一次抽取出的记忆，帮助去重。
+        existing_memories (list, optional): 当前作用域下已存在的记忆集合。
+        new_messages (str | list, optional): 当前批次新消息；字符串会原样透传，列表会 JSON 序列化。
+        last_k_messages (list, optional): 最近 k 条对话历史（用于补上下文）。
+        current_date (str, optional): 当前日期（YYYY-MM-DD）；为空时使用 UTC 今天。
+        timestamp (str, optional): 观测时间（兼容历史参数名）；为空时回落到 current_date。
+        custom_instructions (str, optional): 业务自定义抽取规则，会附加到提示词末尾。
+        use_input_language (bool): 是否强制模型按输入消息的语言/文字系统输出。
+
+    Returns:
+        str: 拼接完成的 user prompt 文本。
     """
     current_date, observation_date = _resolve_dates(current_date, timestamp)
 
     sections = []
+    # 固定结构分段，便于模型稳定读取上下文并降低提示词漂移。
     sections.append(f"## Summary\n{_format_summary(summary)}")
     sections.append(f"## Last k Messages\n{_format_conversation_history(last_k_messages)}")
     sections.append(f"## Recently Extracted Memories\n{_serialize_memories(recently_extracted_memories)}")
@@ -1042,9 +1059,11 @@ def generate_additive_extraction_prompt(
     sections.append(f"## Current Date\n{current_date}")
 
     if custom_instructions:
+        # 允许调用方动态注入业务规则（优先级高于通用默认策略）。
         sections.append(f"## Custom Instructions\n{custom_instructions}")
 
     if use_input_language:
+        # 多语言场景下约束输出语言与输入一致，避免被默认翻译到英文。
         sections.append(
             "## Language Requirement\n"
             "CRITICAL: Respond in the SAME LANGUAGE and SCRIPT as the input messages.\n"
@@ -1059,4 +1078,5 @@ def generate_additive_extraction_prompt(
         )
 
     sections.append("# Output:")
+    # 按双换行拼接，提升可读性并保持段落边界清晰。
     return "\n\n".join(sections)

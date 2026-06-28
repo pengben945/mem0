@@ -20,10 +20,16 @@ logger = logging.getLogger(__name__)
 
 
 def lemmatize_for_bm25(text: str) -> str:
-    """Lemmatize text for BM25 matching.
+    """
+    为 BM25 关键词检索做词形还原预处理。
 
-    Returns space-joined lemmas for full-text search. Falls back to
-    the original text if spaCy is unavailable.
+    会把输入文本转为小写后送入 spaCy，仅保留“非标点、非停用词”的词元，
+    并返回以空格拼接的 lemma 字符串（用于后续全文检索/倒排匹配）。
+
+    额外规则：若原词以 `-ing` 结尾且与 lemma 不同，会把原词也一并保留，
+    以缓解名词/动词语境导致的词形差异（如 meeting/meet）。
+
+    当 spaCy 不可用时，回退为原始文本，保证主流程不被阻断。
     """
     from mem0.utils.spacy_models import get_nlp_lemma
 

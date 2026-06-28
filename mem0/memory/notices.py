@@ -159,10 +159,25 @@ def display_temporal_usage_notice(
     trigger_source: str,
     trigger_reason: str,
 ) -> None:
-    """Best-effort temporal usage notice. Never raises or writes unless displayed."""
+    """
+    按实验开关与配额策略，尝试展示“时间语义使用提示”（temporal usage notice）。
+
+    该函数是 best-effort：
+    - 任意异常都会被吞掉，不影响主业务流程；
+    - 只有命中 displayed 变体且配置可展示时，才会向 stderr 打印提示文案；
+    - 无论是否展示，都会在符合条件时上报一次机会事件（用于实验分析）。
+
+    Args:
+        memory_instance: 当前 Memory/AsyncMemory 实例（用于关联上下文）。
+        sync_type (str): 调用类型（如 "sync"/"async"）。
+        trigger_function (str): 触发函数名（如 "add"/"search"）。
+        trigger_source (str): 触发来源（如 payload 中哪个信号触发）。
+        trigger_reason (str): 触发原因（用于遥测分析）。
+    """
     if not telemetry_module.MEM0_TELEMETRY:
         return
 
+    # 达到展示容量上限后，本进程内不再尝试该提示。
     if _temporal_usage_at_capacity():
         return
 
@@ -176,6 +191,7 @@ def display_temporal_usage_notice(
         if variant in (None, False):
             return
 
+        # 从 flag payload 中提取 temporal notice 配置（文案、开关、展示类型等）。
         payload = _coerce_mapping(flags.get_flag_payload(FLAG_KEY))
         notices = payload.get("notices", {})
         notice_config = _coerce_mapping(
@@ -199,6 +215,7 @@ def display_temporal_usage_notice(
         elif variant != DISPLAYED_VARIANT:
             bypass_reason = "holdout" if variant == HOLDOUT_VARIANT else "not_displayed"
 
+        # 仅 displayed 变体 + 开启 + 有文案时才真正展示到终端。
         displayed = variant == DISPLAYED_VARIANT and enabled and bool(copy)
 
         if not _record_temporal_usage_opportunity(
@@ -411,9 +428,27 @@ def detect_scale_threshold_from_add_result(
     memory_instance,
     add_result: Any,
 ) -> Optional[Tuple[str, str, Optional[int], Optional[int], int]]:
+    """
+    基于 add() 返回结果判断是否触发“规模阈值”提示（memory_count 维度）。
+
+    触发条件（需全部满足）：
+    1. Telemetry 已开启；
+    2. 本次 add_result 中至少有 1 条 ADD 事件；
+    3. 达到检查时机（首次，或累计新增达到检查间隔）；
+    4. 当前进程和持久化状态都尚未判定过“阈值已评估”；
+    5. 底层向量库的记忆总量 >= SCALE_MEMORY_COUNT_THRESHOLD；
+    6. 成功写入“已评估”状态，避免重复提示。
+
+    Returns:
+        Optional[Tuple[str, str, Optional[int], Optional[int], int]]:
+            命中时返回通知元组：
+            ("memory_count", "memory_count_threshold", None, provider_count, threshold)
+            未命中返回 None。
+    """
     if not telemetry_module.MEM0_TELEMETRY:
         return None
 
+    # 只统计真正新增的记忆数量；0 说明本次没有新增，不需要做规模阈值判断。
     added_count = _count_added_memories(add_result)
     if added_count == 0:
         return None
@@ -423,10 +458,12 @@ def detect_scale_threshold_from_add_result(
     global _scale_memory_count_threshold_evaluated_in_process
     try:
         with _state_lock:
+            # 进程内已评估过阈值，直接跳过后续检查。
             if _scale_memory_count_threshold_evaluated_in_process:
                 return None
 
             _scale_memory_count_adds_since_check += added_count
+            # 控制检查频率：首次必查；之后按累计新增量到达间隔再查，减少昂贵的 provider 计数调用。
             should_check = (
                 not _scale_memory_count_checked_in_process
                 or _scale_memory_count_adds_since_check >= SCALE_MEMORY_COUNT_CHECK_INTERVAL
@@ -439,16 +476,19 @@ def detect_scale_threshold_from_add_result(
 
             config = _load_config()
             scale_state = _get_notice_state(config, SCALE_THRESHOLD_STATE_KEY)
+            # 持久化状态已记录“阈值评估完成”，则本进程同步标记，避免重复检查。
             if scale_state.get("memory_count_threshold_evaluated"):
                 _scale_memory_count_threshold_evaluated_in_process = True
                 return None
     except Exception:
         return None
 
+    # 走到这里才执行一次真实 provider 记忆数统计。
     provider_count = _get_provider_memory_count(memory_instance)
     if provider_count is None or provider_count < SCALE_MEMORY_COUNT_THRESHOLD:
         return None
 
+    # 原子标记“已评估”；失败则不触发提示，避免并发下重复展示。
     if not _mark_scale_memory_count_threshold_evaluated():
         return None
 
@@ -471,10 +511,32 @@ def display_scale_threshold_notice(
     memory_count: Optional[int] = None,
     threshold: Optional[int] = None,
 ) -> None:
-    """Best-effort scale notice. Never raises or writes unless displayed."""
+    """
+    按实验开关与配额策略，尝试展示“规模阈值提示”（scale threshold notice）。
+
+    该提示通常由两类信号触发：
+    - top_k 过大（高召回量可能影响性能/成本）
+    - memory_count 达到阈值（数据规模进入新阶段）
+
+    行为同样是 best-effort：
+    - 任意异常不向上抛出；
+    - 只有 displayed 变体且文案可用时才打印到 stderr；
+    - 满足条件时会上报遥测事件，用于分析展示/旁路原因。
+
+    Args:
+        memory_instance: 当前 Memory/AsyncMemory 实例（用于关联上下文）。
+        sync_type (str): 调用类型（如 "sync"/"async"）。
+        trigger_function (str): 触发函数名（如 "add"/"search"）。
+        trigger_source (str): 触发来源（如 "top_k" 或 "memory_count"）。
+        trigger_reason (str): 触发原因（用于遥测分析）。
+        top_k (Optional[int]): 触发时的 top_k 值（若来源为 top_k）。
+        memory_count (Optional[int]): 触发时的总记忆数（若来源为 memory_count）。
+        threshold (Optional[int]): 对应触发阈值。
+    """
     if not telemetry_module.MEM0_TELEMETRY:
         return
 
+    # 达到展示容量上限后，本进程内不再尝试该提示。
     if _scale_threshold_at_capacity():
         return
 
@@ -488,6 +550,7 @@ def display_scale_threshold_notice(
         if variant in (None, False):
             return
 
+        # 读取 scale notice 配置，并按触发来源选择对应文案模板。
         payload = _coerce_mapping(flags.get_flag_payload(FLAG_KEY))
         notices = payload.get("notices", {})
         notice_config = _coerce_mapping(
@@ -513,6 +576,7 @@ def display_scale_threshold_notice(
         elif variant != DISPLAYED_VARIANT:
             bypass_reason = "holdout" if variant == HOLDOUT_VARIANT else "not_displayed"
 
+        # 仅 displayed 变体 + 开启 + 有文案时才真正展示到终端。
         displayed = variant == DISPLAYED_VARIANT and enabled and bool(copy)
 
         if not _record_scale_threshold_opportunity(

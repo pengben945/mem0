@@ -67,7 +67,15 @@ def get_nlp_full():
 
 
 def get_nlp_lemma():
-    """Return spaCy model with only lemmatizer for BM25 text processing."""
+    """
+    返回仅用于词形还原的 spaCy 模型实例（BM25 预处理专用）。
+
+    设计目标：
+    - 懒加载：首次调用才加载模型，减少启动开销
+    - 单例复用：同进程内复用 `_nlp_lemma`，避免重复占用内存
+    - 轻量化：禁用 `ner`、`parser`，仅保留词形还原所需组件
+    - 容错：若加载失败，记录失败标记并返回 None，后续调用直接快速返回
+    """
     global _nlp_lemma, _load_failed_lemma
     if _load_failed_lemma:
         return None
